@@ -19,7 +19,13 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.view.InputDevice
 import android.view.KeyEvent
+import android.view.MotionEvent
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.os.SystemClock
 import android.provider.Settings
 import android.text.TextUtils
 import android.view.Gravity
@@ -240,15 +246,18 @@ class MainActivity : Activity() {
         registerReceiver(ticker, IntentFilter(Intent.ACTION_TIME_TICK))
         tick()
         applyPhoto() // por si se ha subido una foto nueva desde Barrix
+        web?.onResume()
     }
 
     override fun onPause() {
         super.onPause()
+        web?.onPause()
         try { unregisterReceiver(ticker) } catch (e: Exception) { }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        web?.destroy()
         anim?.cancel()
         try { unregisterReceiver(pkgChange) } catch (e: Exception) { }
     }
@@ -256,6 +265,7 @@ class MainActivity : Activity() {
     // Pulsar Home estando ya aquí: cerrar el panel, volver arriba y enfocar la primera tarjeta.
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        if (browser != null) closeBrowser()
         if (panel != null) closePanel()
         scroll.smoothScrollTo(0, 0)
         first?.requestFocus()
@@ -446,6 +456,131 @@ class MainActivity : Activity() {
         o2.inSampleSize = s
         o2.inPreferredConfig = Bitmap.Config.RGB_565
         return BitmapFactory.decodeFile(path, o2)
+    }
+
+    // ---------- Navegador integrado (con cursor) ----------
+    // Mando: flechas mueven el cursor (en el borde se desplaza la página), OK pulsa,
+    // Atrás vuelve (o sale), Menú sale. Hace falta <uses-permission android:name="android.permission.INTERNET"/>.
+
+    private var browser: FrameLayout? = null
+    private var web: WebView? = null
+    private var cursor: View? = null
+    private var curX = 0f
+    private var curY = 0f
+
+    private fun openBrowser(url: String) {
+        if (browser != null) return
+        val b = FrameLayout(this)
+        b.setBackgroundColor(Color.BLACK)
+        b.isClickable = true
+
+        val w = WebView(this)
+        val s = w.settings
+        s.javaScriptEnabled = true
+        s.domStorageEnabled = true
+        s.mediaPlaybackRequiresUserGesture = false
+        s.useWideViewPort = true
+        s.loadWithOverviewMode = true
+        s.userAgentString = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+        w.webViewClient = WebViewClient()
+        w.webChromeClient = WebChromeClient()
+        b.addView(w, FrameLayout.LayoutParams(MP, MP))
+
+        val cur = View(this)
+        val g = GradientDrawable()
+        g.shape = GradientDrawable.OVAL
+        g.setColor(Color.WHITE)
+        g.setStroke(dp(2), 0xFF111111.toInt())
+        cur.background = g
+        b.addView(cur, FrameLayout.LayoutParams(dp(20), dp(20)))
+
+        stage.addView(b, FrameLayout.LayoutParams(MP, MP))
+        content.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+        browser = b
+        web = w
+        cursor = cur
+        val m = resources.displayMetrics
+        curX = m.widthPixels / 2f
+        curY = m.heightPixels / 2f
+        moveCursor(0f, 0f)
+        w.loadUrl(url)
+        Toast.makeText(this, "OK: pulsar · Atrás: volver · Menú: salir", Toast.LENGTH_LONG).show()
+    }
+
+    private fun closeBrowser() {
+        val b = browser ?: return
+        stage.removeView(b)
+        b.removeAllViews()
+        web?.destroy()
+        web = null
+        cursor = null
+        browser = null
+        content.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+        first?.requestFocus()
+    }
+
+    private fun moveCursor(dx: Float, dy: Float) {
+        val m = resources.displayMetrics
+        val maxX = m.widthPixels - 1f
+        val maxY = m.heightPixels - 1f
+        val edge = dp(3).toFloat()
+        val w = web
+        if (w != null) {
+            if (dy < 0 && curY <= edge) w.scrollBy(0, -dp(70))
+            if (dy > 0 && curY >= maxY - edge) w.scrollBy(0, dp(70))
+            if (dx < 0 && curX <= edge) w.scrollBy(-dp(70), 0)
+            if (dx > 0 && curX >= maxX - edge) w.scrollBy(dp(70), 0)
+        }
+        curX = (curX + dx).coerceIn(0f, maxX)
+        curY = (curY + dy).coerceIn(0f, maxY)
+        cursor?.translationX = curX - dp(10)
+        cursor?.translationY = curY - dp(10)
+    }
+
+    private fun touch(action: Int) {
+        val w = web ?: return
+        val t = SystemClock.uptimeMillis()
+        val e = MotionEvent.obtain(t, t, action, curX, curY, 0)
+        e.source = InputDevice.SOURCE_TOUCHSCREEN
+        w.dispatchTouchEvent(e)
+        e.recycle()
+    }
+
+    override fun dispatchKeyEvent(ev: KeyEvent): Boolean {
+        val w = web
+        if (browser != null && w != null) {
+            val down = ev.action == KeyEvent.ACTION_DOWN
+            when (ev.keyCode) {
+                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
+                KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                    if (down) {
+                        // Cuanto más tiempo se mantiene pulsada la flecha, más rápido va el cursor.
+                        val step = dp(8) * (1f + minOf(ev.repeatCount, 12) / 3f)
+                        when (ev.keyCode) {
+                            KeyEvent.KEYCODE_DPAD_UP -> moveCursor(0f, -step)
+                            KeyEvent.KEYCODE_DPAD_DOWN -> moveCursor(0f, step)
+                            KeyEvent.KEYCODE_DPAD_LEFT -> moveCursor(-step, 0f)
+                            else -> moveCursor(step, 0f)
+                        }
+                    }
+                    return true
+                }
+                KeyEvent.KEYCODE_DPAD_CENTER -> {
+                    if (down && ev.repeatCount == 0) touch(MotionEvent.ACTION_DOWN)
+                    else if (!down) touch(MotionEvent.ACTION_UP)
+                    return true
+                }
+                KeyEvent.KEYCODE_BACK -> {
+                    if (!down) { if (w.canGoBack()) w.goBack() else closeBrowser() }
+                    return true
+                }
+                KeyEvent.KEYCODE_MENU -> {
+                    if (!down) closeBrowser()
+                    return true
+                }
+            }
+        }
+        return super.dispatchKeyEvent(ev)
     }
 
     // ---------- Panel "Aspecto" ----------
@@ -866,6 +1001,11 @@ class MainActivity : Activity() {
     }
 
     private fun launch(a: App) {
+        // Los accesos web (Google, SoundCloud) se abren en el navegador integrado.
+        if (a.pkg.startsWith("barrix.shortcut.")) {
+            val url = a.intent.dataString
+            if (url != null) { openBrowser(url); return }
+        }
         try {
             startActivity(a.intent)
         } catch (e: Exception) {
