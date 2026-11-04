@@ -3,6 +3,7 @@ package com.barrix.launcher
 import android.animation.ValueAnimator
 import android.app.Activity
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -178,10 +179,14 @@ class MainActivity : Activity() {
         right.orientation = LinearLayout.HORIZONTAL
         aspectPill = pill("Aspecto") { openPanel() }
         right.addView(aspectPill)
-        val wifi = pill("Wi-Fi") { openSettings(Settings.ACTION_WIFI_SETTINGS) }
+        val wifi = pill("Wi-Fi") {
+            openSettings(Settings.ACTION_WIFI_SETTINGS, "com.amazon.tv.settings.v2.tv.network.NetworkActivity")
+        }
         (wifi.layoutParams as LinearLayout.LayoutParams).leftMargin = dp(10)
         right.addView(wifi)
-        val setBtn = pill("Ajustes") { openSettings(Settings.ACTION_SETTINGS) }
+        val setBtn = pill("Ajustes") {
+            openSettings(Settings.ACTION_SETTINGS, "com.amazon.tv.settings.v2.tv.device.DeviceActivity")
+        }
         (setBtn.layoutParams as LinearLayout.LayoutParams).leftMargin = dp(10)
         right.addView(setBtn)
         header.addView(right, FrameLayout.LayoutParams(WC, WC, Gravity.END or Gravity.TOP))
@@ -618,22 +623,11 @@ class MainActivity : Activity() {
             iv.setImageDrawable(a.banner)
             inner.addView(iv, FrameLayout.LayoutParams(MP, MP))
         } else {
-            val s = (tileH * 0.5f).toInt()
+            // Sin banner: solo el icono, centrado. El nombre sale arriba al enfocar la tarjeta.
+            val s = (tileH * 0.6f).toInt()
             val iv = ImageView(this)
             iv.setImageDrawable(a.icon)
-            val ilp = FrameLayout.LayoutParams(s, s, Gravity.CENTER_HORIZONTAL or Gravity.TOP)
-            ilp.topMargin = dp(8)
-            inner.addView(iv, ilp)
-            val tv = text(12f, 0xFFE8E6E1.toInt())
-            tv.text = a.label
-            tv.gravity = Gravity.CENTER
-            tv.setSingleLine(true)
-            tv.ellipsize = TextUtils.TruncateAt.END
-            val tlp = FrameLayout.LayoutParams(MP, WC, Gravity.BOTTOM)
-            tlp.bottomMargin = dp(6)
-            tlp.leftMargin = dp(6)
-            tlp.rightMargin = dp(6)
-            inner.addView(tv, tlp)
+            inner.addView(iv, FrameLayout.LayoutParams(s, s, Gravity.CENTER))
         }
         box.addView(inner, FrameLayout.LayoutParams(MP, MP))
 
@@ -679,7 +673,17 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun openSettings(action: String) {
+    // En Fire TV el aviso genérico de ajustes acaba en el Home de Amazon, así que primero se
+    // prueban actividades concretas de la app de ajustes de Fire TV (com.amazon.tv.settings.v2).
+    private fun openSettings(action: String, vararg direct: String) {
+        for (cls in direct) {
+            try {
+                val cn = ComponentName("com.amazon.tv.settings.v2", cls)
+                packageManager.getActivityInfo(cn, 0)
+                startActivity(Intent().setComponent(cn).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                return
+            } catch (e: Exception) { }
+        }
         for (act in listOf(action, Settings.ACTION_SETTINGS)) {
             try {
                 startActivity(Intent(act).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
