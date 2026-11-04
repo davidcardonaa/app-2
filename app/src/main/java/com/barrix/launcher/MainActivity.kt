@@ -13,9 +13,13 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Outline
 import android.graphics.Typeface
+import android.content.pm.ApplicationInfo
+import android.graphics.drawable.AdaptiveIconDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
 import android.provider.Settings
 import android.text.TextUtils
 import android.view.Gravity
@@ -144,10 +148,15 @@ class MainActivity : Activity() {
 
         val root = FrameLayout(this)
         root.setPadding(dp(48), dp(28), dp(48), 0)
+        // Sin recortes: la tarjeta enfocada crece un 10 % y se sale un poco de su sitio.
+        root.clipChildren = false
+        root.clipToPadding = false
         stage.addView(root, FrameLayout.LayoutParams(MP, MP))
 
         content = LinearLayout(this)
         content.orientation = LinearLayout.VERTICAL
+        content.clipChildren = false
+        content.clipToPadding = false
         root.addView(content, FrameLayout.LayoutParams(MP, MP))
 
         // Cabecera: saludo, hora y fecha a la izquierda; botones a la derecha.
@@ -309,6 +318,48 @@ class MainActivity : Activity() {
         setAccent(if (dyn() && f != null && f.color != 0) f.color else themeColor())
     }
 
+    /**
+     * Quita los márgenes transparentes de un banner (p. ej. Amazon Kids trae el logo pequeño en
+     * medio de un lienzo vacío) para que, al rellenar la tarjeta, se vea el dibujo entero.
+     * Si no sobra nada, devuelve el banner tal cual.
+     */
+    private fun trimmed(d: Drawable?): Drawable? {
+        if (d == null) return null
+        return try {
+            val iw = if (d.intrinsicWidth > 0) d.intrinsicWidth else 320
+            val ih = if (d.intrinsicHeight > 0) d.intrinsicHeight else 180
+            val k = minOf(1f, 480f / iw)
+            val w = maxOf(1, (iw * k).toInt())
+            val h = maxOf(1, (ih * k).toInt())
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            d.setBounds(0, 0, w, h)
+            d.draw(Canvas(bmp))
+            val px = IntArray(w * h)
+            bmp.getPixels(px, 0, w, 0, 0, w, h)
+            var x0 = w; var y0 = h; var x1 = -1; var y1 = -1
+            for (y in 0 until h) for (x in 0 until w) {
+                if (Color.alpha(px[y * w + x]) > 24) {
+                    if (x < x0) x0 = x
+                    if (x > x1) x1 = x
+                    if (y < y0) y0 = y
+                    if (y > y1) y1 = y
+                }
+            }
+            val cw = x1 - x0 + 1
+            val ch = y1 - y0 + 1
+            // Nada que recortar (o imagen vacía): se deja el banner original.
+            if (x1 < 0 || cw * ch >= w * h * 0.92f) {
+                bmp.recycle()
+                return d
+            }
+            val out = Bitmap.createBitmap(bmp, x0, y0, cw, ch)
+            if (out !== bmp) bmp.recycle()
+            android.graphics.drawable.BitmapDrawable(resources, out)
+        } catch (e: Throwable) {
+            d
+        }
+    }
+
     /** Color más "de marca" de una imagen: el tono con más peso entre los píxeles vivos. */
     private fun dominant(d: Drawable?): Int {
         if (d == null) return 0
@@ -457,7 +508,7 @@ class MainActivity : Activity() {
         }
         card.addView(row)
 
-        val dynBtn = pill("") { }
+        val dynBtn = pill("", 0x33FFFFFF) { }
         val dynLabel = { dynBtn.text = "Color según la app: " + (if (dyn()) "Sí" else "No") }
         dynLabel()
         dynBtn.setOnClickListener {
@@ -469,7 +520,7 @@ class MainActivity : Activity() {
         card.addView(dynBtn)
 
         if (photoFile().exists()) {
-            val pb = pill("") { }
+            val pb = pill("", 0x33FFFFFF) { }
             val pl = { pb.text = "Foto de fondo: " + (if (prefs().getBoolean("photo", true)) "Sí" else "No") }
             pl()
             pb.setOnClickListener {
@@ -486,7 +537,21 @@ class MainActivity : Activity() {
             card.addView(h)
         }
 
-        val close = pill("Cerrar") { closePanel() }
+        val nHidden = hidden().size
+        if (nHidden > 0) {
+            val rb = pill("", 0x33FFFFFF) { }
+            rb.text = "Restaurar apps ocultas ($nHidden)"
+            rb.setOnClickListener {
+                prefs().edit().remove("hidden").apply()
+                closePanel()
+                render()
+                Toast.makeText(this, "Apps restauradas", Toast.LENGTH_SHORT).show()
+            }
+            (rb.layoutParams as LinearLayout.LayoutParams).topMargin = dp(10)
+            card.addView(rb)
+        }
+
+        val close = pill("Cerrar", 0x33FFFFFF) { closePanel() }
         (close.layoutParams as LinearLayout.LayoutParams).topMargin = dp(16)
         card.addView(close)
 
@@ -526,6 +591,7 @@ class MainActivity : Activity() {
     private fun loadApps(): List<App> {
         val pm = packageManager
         val seen = HashSet<String>()
+        val seenLabels = HashSet<String>() // evita apps repetidas con el mismo nombre
         val out = ArrayList<App>()
         for (cat in listOf(Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER)) {
             val tv = cat == Intent.CATEGORY_LEANBACK_LAUNCHER
@@ -534,19 +600,119 @@ class MainActivity : Activity() {
                 val ai = ri.activityInfo
                 if (ai.packageName == packageName || ai.packageName == "com.amazon.tv.launcher") continue
                 if (!seen.add(ai.packageName)) continue
+
+                // Filtro de apps que no son "de usar": servicios del sistema en la lista normal
+                // (no de TV) y apps sin icono propio (salen con el muñeco de Android).
+                val flags = ai.applicationInfo.flags
+                val system = flags and ApplicationInfo.FLAG_SYSTEM != 0 &&
+                    flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP == 0
+                if (!tv && system) continue
+                if (ai.icon == 0 && ai.applicationInfo.icon == 0) continue
+
+                val label = ri.loadLabel(pm).toString().trim()
+                if (ai.packageName in ALWAYS_HIDE_PKGS) continue
+                val low = label.lowercase(es)
+                if (ALWAYS_HIDE_LABELS.any { low == it || (it.length > 8 && low.contains(it)) }) continue
+                if (!seenLabels.add(low)) continue
+
                 val launch = Intent(Intent.ACTION_MAIN).addCategory(cat)
                     .setClassName(ai.packageName, ai.name)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
-                val banner = if (tv) (ai.loadBanner(pm) ?: ai.applicationInfo.loadBanner(pm)) else null
+                val banner = if (tv) trimmed(ai.loadBanner(pm) ?: ai.applicationInfo.loadBanner(pm)) else null
                 val icon = ri.loadIcon(pm)
-                out.add(App(ri.loadLabel(pm).toString(), ai.packageName, launch, banner, icon, tv, dominant(banner ?: icon)))
+                out.add(App(label, ai.packageName, launch, banner, icon, tv, dominant(banner ?: icon)))
             }
         }
+        out.add(googleApp())
+        if ("soundcloud" !in seenLabels) out.add(soundcloudApp()) // solo si no está la app de verdad
         out.sortBy { it.label.lowercase(es) }
         return out
     }
 
+    // Apps que nunca se muestran (por paquete o por nombre, en español e inglés).
+    private val ALWAYS_HIDE_PKGS = setOf(
+        "com.amazon.gamehub",                  // Amazon Game Center
+        "com.amazon.ftv.profilepicker",        // Interfaz de usuario del perfil de Fire TV
+        "com.amazon.ssm",                      // Monitor de estado del sistema
+        "com.amazon.cloud9"                    // Navegador Silk
+    )
+    private val ALWAYS_HIDE_LABELS = listOf(
+        "game center", "descargas", "downloads",
+        "interfaz de usuario del perfil", "profile",
+        "monitor de estado", "system status",
+        "silk", "navegador",
+        "what should i watch", "qué ver",
+        "news", "noticias"
+    )
+
+    /** Acceso directo a Google: abre google.com en el navegador del sistema. */
+    private fun googleApp(): App {
+        val w = 640
+        val h = 360
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        c.drawColor(Color.WHITE)
+        val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        p.textSize = 150f
+        p.typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+        val letters = "Google"
+        val cols = intArrayOf(0xFF4285F4.toInt(), 0xFFEA4335.toInt(), 0xFFFBBC05.toInt(),
+            0xFF4285F4.toInt(), 0xFF34A853.toInt(), 0xFFEA4335.toInt())
+        var total = 0f
+        for (ch in letters) total += p.measureText(ch.toString())
+        var x = (w - total) / 2f
+        val y = h / 2f + 50f
+        for (i in letters.indices) {
+            p.color = cols[i]
+            c.drawText(letters[i].toString(), x, y, p)
+            x += p.measureText(letters[i].toString())
+        }
+        val d = android.graphics.drawable.BitmapDrawable(resources, bmp)
+        return App("Google", "barrix.shortcut.google", browserIntent("https://www.google.com"), d, d, true, 0xFF4285F4.toInt())
+    }
+
+    /** Acceso directo a SoundCloud web (para cuando la app no está disponible en tu país). */
+    private fun soundcloudApp(): App {
+        val w = 640
+        val h = 360
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        c.drawColor(0xFFFF5500.toInt())
+        val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        p.color = Color.WHITE
+        p.textSize = 96f
+        p.typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+        p.textAlign = android.graphics.Paint.Align.CENTER
+        c.drawText("SoundCloud", w / 2f, h / 2f + 34f, p)
+        val d = android.graphics.drawable.BitmapDrawable(resources, bmp)
+        return App("SoundCloud", "barrix.shortcut.soundcloud", browserIntent("https://soundcloud.com"), d, d, true, 0xFFFF5500.toInt())
+    }
+
+    /** Abre la web en el mejor navegador instalado (Chrome o Firefox si los hay; si no, el del sistema). */
+    private fun browserIntent(url: String): Intent {
+        val i = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        for (pkg in listOf("com.android.chrome", "org.mozilla.firefox", "org.mozilla.firefox_tv", "com.puffin.tv")) {
+            try {
+                packageManager.getPackageInfo(pkg, 0)
+                i.setPackage(pkg)
+                break
+            } catch (e: Exception) { }
+        }
+        return i
+    }
+
     private fun pins(): Set<String> = prefs().getStringSet("pins", emptySet())!!.toSet()
+
+    private fun hidden(): Set<String> = prefs().getStringSet("hidden", emptySet())!!.toSet()
+
+    /** Botón Menú del mando sobre una tarjeta: la oculta. Se restauran desde "Aspecto". */
+    private fun hideApp(a: App) {
+        val h = hidden().toMutableSet()
+        h.add(a.pkg)
+        prefs().edit().putStringSet("hidden", h).apply()
+        Toast.makeText(this, a.label + " oculta (se restaura desde Aspecto)", Toast.LENGTH_LONG).show()
+        render()
+    }
 
     private fun togglePin(a: App) {
         val p = pins().toMutableSet()
@@ -561,10 +727,12 @@ class MainActivity : Activity() {
     private fun render() {
         list.removeAllViews()
         val pins = pins()
+        val hid = hidden()
+        val visible = allApps.filter { it.pkg !in hid }
         val groups = listOf(
-            "Favoritas" to allApps.filter { it.pkg in pins },
-            "Apps" to allApps.filter { it.tv && it.pkg !in pins },
-            "Más apps" to allApps.filter { !it.tv && it.pkg !in pins }
+            "Favoritas" to visible.filter { it.pkg in pins },
+            "Apps" to visible.filter { it.tv && it.pkg !in pins },
+            "Más apps" to visible.filter { !it.tv && it.pkg !in pins }
         )
         var target: View? = null
         first = null
@@ -623,16 +791,16 @@ class MainActivity : Activity() {
             iv.setImageDrawable(a.banner)
             inner.addView(iv, FrameLayout.LayoutParams(MP, MP))
         } else {
-            // Sin banner: solo el icono, centrado. El nombre sale arriba al enfocar la tarjeta.
-            val s = (tileH * 0.6f).toInt()
-            val iv = ImageView(this)
-            iv.setImageDrawable(a.icon)
-            inner.addView(iv, FrameLayout.LayoutParams(s, s, Gravity.CENTER))
+            fillWithIcon(inner, a)
         }
         box.addView(inner, FrameLayout.LayoutParams(MP, MP))
 
         box.setOnClickListener { launch(a) }
         box.setOnLongClickListener { togglePin(a); true }
+        box.setOnKeyListener { _, code, ev ->
+            if (code == KeyEvent.KEYCODE_MENU && ev.action == KeyEvent.ACTION_UP) { hideApp(a); true }
+            else code == KeyEvent.KEYCODE_MENU
+        }
         box.setOnFocusChangeListener { v, focused ->
             v.background = shape(Color.TRANSPARENT, 13, 3, if (focused) Color.WHITE else Color.TRANSPARENT)
             v.translationZ = if (focused) dp(8).toFloat() else 0f
@@ -647,7 +815,39 @@ class MainActivity : Activity() {
         return box
     }
 
-    private fun pill(label: String, onClick: () -> Unit): TextView {
+    /**
+     * Apps sin banner: la tarjeta se llena entera con el icono.
+     * - Icono adaptativo (Android 8+): su fondo cubre toda la tarjeta y el dibujo va grande encima.
+     * - Icono normal: fondo con el color de la app y el icono lo más grande posible.
+     */
+    private fun fillWithIcon(inner: FrameLayout, a: App) {
+        val ic = a.icon
+        val side = tileH - dp(6) // alto útil de la tarjeta
+        if (Build.VERSION.SDK_INT >= 26 && ic is AdaptiveIconDrawable) {
+            val bgIv = ImageView(this)
+            bgIv.scaleType = ImageView.ScaleType.CENTER_CROP
+            bgIv.setImageDrawable(ic.background)
+            inner.addView(bgIv, FrameLayout.LayoutParams(MP, MP))
+            val fgIv = ImageView(this)
+            fgIv.scaleType = ImageView.ScaleType.FIT_XY
+            fgIv.setImageDrawable(ic.foreground)
+            val big = (side * 1.3f).toInt() // la zona segura del icono es ~2/3 del lienzo
+            inner.addView(fgIv, FrameLayout.LayoutParams(big, big, Gravity.CENTER))
+        } else {
+            val hsv = FloatArray(3)
+            val base = if (a.color != 0) a.color else 0xFF3A3F4B.toInt()
+            Color.colorToHSV(base, hsv)
+            hsv[2] = minOf(hsv[2], 0.45f)
+            inner.setBackgroundColor(Color.HSVToColor(hsv))
+            val iv = ImageView(this)
+            iv.scaleType = ImageView.ScaleType.FIT_CENTER
+            iv.setImageDrawable(ic)
+            val s = (side * 0.9f).toInt()
+            inner.addView(iv, FrameLayout.LayoutParams(s, s, Gravity.CENTER))
+        }
+    }
+
+    private fun pill(label: String, fill: Int = 0x80000000.toInt(), onClick: () -> Unit): TextView {
         val t = text(13f, Color.WHITE)
         t.text = label
         t.gravity = Gravity.CENTER
@@ -655,12 +855,12 @@ class MainActivity : Activity() {
         t.isFocusable = true
         t.isClickable = true
         t.layoutParams = LinearLayout.LayoutParams(WC, WC)
-        t.background = shape(0x33FFFFFF, 20, 2, Color.TRANSPARENT)
+        t.background = shape(fill, 20)
         t.setOnClickListener { onClick() }
+        // Enfocado: píldora blanca con texto oscuro (limpio, sin borde ni zoom que difuminen el texto).
         t.setOnFocusChangeListener { v, focused ->
-            v.background = shape(0x33FFFFFF, 20, 2, if (focused) Color.WHITE else Color.TRANSPARENT)
-            val sc = if (focused) 1.08f else 1f
-            v.animate().scaleX(sc).scaleY(sc).setDuration(120).start()
+            v.background = shape(if (focused) Color.WHITE else fill, 20)
+            (v as TextView).setTextColor(if (focused) 0xFF111111.toInt() else Color.WHITE)
         }
         return t
     }
