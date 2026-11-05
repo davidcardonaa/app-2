@@ -40,6 +40,10 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import java.security.SecureRandom
+import android.graphics.Paint
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -241,6 +245,13 @@ class MainActivity : Activity() {
         f.addDataScheme("package")
         registerReceiver(pkgChange, f)
 
+        // Si el proceso sigue vivo (lo mantiene el servicio de Home), se pinta al instante la
+        // última lista de apps y se refresca en segundo plano.
+        val last = AppCache.last
+        if (last != null) {
+            allApps = last
+            render()
+        }
         tick()
         reload()
         applyPhoto()
@@ -257,12 +268,14 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         super.onPause()
+        if (photoServer != null) closePanel() // la pantalla del QR no sobrevive en segundo plano
         web?.onPause()
         try { unregisterReceiver(ticker) } catch (e: Exception) { }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        stopServer()
         web?.destroy()
         anim?.cancel()
         try { unregisterReceiver(pkgChange) } catch (e: Exception) { }
@@ -415,7 +428,7 @@ class MainActivity : Activity() {
         return try {
             val iw = if (d.intrinsicWidth > 0) d.intrinsicWidth else 320
             val ih = if (d.intrinsicHeight > 0) d.intrinsicHeight else 180
-            val k = minOf(1f, 480f / iw)
+            val k = minOf(1f, 384f / iw)
             val w = maxOf(1, (iw * k).toInt())
             val h = maxOf(1, (ih * k).toInt())
             val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
@@ -731,6 +744,10 @@ class MainActivity : Activity() {
         (dynBtn.layoutParams as LinearLayout.LayoutParams).topMargin = dp(16)
         card.addView(dynBtn)
 
+        val upBtn = pill("Subir foto desde el móvil", 0x33FFFFFF) { openUpload() }
+        (upBtn.layoutParams as LinearLayout.LayoutParams).topMargin = dp(14)
+        card.addView(upBtn)
+
         if (photoFile().exists()) {
             val pb = pill("", 0x33FFFFFF) { }
             val pl = { pb.text = "Foto de fondo: " + (if (prefs().getBoolean("photo", true)) "Sí" else "No") }
@@ -742,11 +759,6 @@ class MainActivity : Activity() {
             }
             (pb.layoutParams as LinearLayout.LayoutParams).topMargin = dp(10)
             card.addView(pb)
-        } else {
-            val h = text(12f, 0xFF8B92A1.toInt())
-            h.text = "Para usar tu foto de fondo, súbela desde el panel web de Barrix."
-            h.setPadding(0, dp(14), 0, 0)
-            card.addView(h)
         }
 
         val nHidden = hidden().size
@@ -776,11 +788,121 @@ class MainActivity : Activity() {
     }
 
     private fun closePanel() {
+        stopServer()
         val p = panel ?: return
         stage.removeView(p)
         panel = null
         content.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
         aspectPill.requestFocus()
+    }
+
+    // ---------- Foto de fondo desde el móvil (QR) ----------
+
+    private var photoServer: PhotoServer? = null
+
+    private fun stopServer() {
+        photoServer?.stop()
+        photoServer = null
+    }
+
+    /** IP de la tele en la red local (prefiere Wi-Fi o cable). */
+    private fun localIp(): String? {
+        var fallback: String? = null
+        try {
+            val ifs = NetworkInterface.getNetworkInterfaces() ?: return null
+            for (ni in ifs) {
+                if (!ni.isUp || ni.isLoopback) continue
+                for (a in ni.inetAddresses) {
+                    if (a is Inet4Address && !a.isLoopbackAddress) {
+                        val ip = a.hostAddress ?: continue
+                        if (ni.name.startsWith("wlan") || ni.name.startsWith("eth")) return ip
+                        if (fallback == null) fallback = ip
+                    }
+                }
+            }
+        } catch (e: Exception) { }
+        return fallback
+    }
+
+    private fun onPhotoUploaded() {
+        if (isDestroyed) return
+        prefs().edit().putBoolean("photo", true).apply()
+        closePanel()
+        applyPhoto()
+        Toast.makeText(this, "Foto de fondo actualizada", Toast.LENGTH_LONG).show()
+    }
+
+    private fun openUpload() {
+        closePanel()
+        val ip = localIp()
+
+        val p = FrameLayout(this)
+        p.setBackgroundColor(0xCC000000.toInt())
+        p.isClickable = true
+
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        card.gravity = Gravity.CENTER_HORIZONTAL
+        card.setPadding(dp(28), dp(22), dp(28), dp(22))
+        card.background = shape(0xFF14161A.toInt(), 16, 1, 0x33FFFFFF)
+
+        val title = text(20f, Color.WHITE, true)
+        title.text = "Foto de fondo desde el móvil"
+        card.addView(title)
+
+        var started = false
+        if (ip != null) {
+            try {
+                val token = (SecureRandom().nextInt(900000) + 100000).toString()
+                val srv = PhotoServer(photoFile(), token, PhotoServer.Validator { f ->
+                    val o = BitmapFactory.Options()
+                    o.inJustDecodeBounds = true
+                    BitmapFactory.decodeFile(f.path, o)
+                    o.outWidth > 0 && o.outHeight > 0
+                }) { runOnUiThread { onPhotoUploaded() } }
+                val port = srv.start()
+                photoServer = srv
+                val url = "http://$ip:$port/?k=$token"
+
+                val qr = QrView(this, QrEncoder.encode(url))
+                val qlp = LinearLayout.LayoutParams(dp(230), dp(230))
+                qlp.topMargin = dp(16)
+                card.addView(qr, qlp)
+
+                val u = text(13f, 0xFFB0B7C3.toInt())
+                u.text = url
+                u.gravity = Gravity.CENTER
+                u.setPadding(0, dp(10), 0, 0)
+                card.addView(u)
+
+                val steps = text(13f, 0xFF8B92A1.toInt())
+                steps.text = "1. Conecta el móvil a la misma Wi-Fi que la tele\n" +
+                    "2. Escanea el QR con la cámara\n" +
+                    "3. Elige una foto y pulsa «Enviar a la tele»"
+                steps.setPadding(0, dp(12), 0, 0)
+                card.addView(steps)
+                started = true
+            } catch (e: Exception) {
+                stopServer()
+            }
+        }
+        if (!started) {
+            val err = text(14f, Color.WHITE)
+            err.text = if (ip == null) "La tele no está conectada a la Wi-Fi."
+            else "No se pudo abrir el servidor de subida."
+            err.setPadding(0, dp(16), 0, 0)
+            card.addView(err)
+        }
+
+        val close = pill("Cerrar", 0x33FFFFFF) { closePanel() }
+        (close.layoutParams as LinearLayout.LayoutParams).topMargin = dp(16)
+        card.addView(close)
+
+        p.addView(card, FrameLayout.LayoutParams(dp(480), WC, Gravity.CENTER))
+        stage.addView(p, FrameLayout.LayoutParams(MP, MP))
+        content.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+        panel = p
+        close.post { close.requestFocus() }
     }
 
     // ---------- Apps ----------
@@ -792,7 +914,8 @@ class MainActivity : Activity() {
             val apps = try { loadApps() } catch (e: Exception) { emptyList() }
             runOnUiThread {
                 loading = false
-                if (!isDestroyed) {
+                if (apps.isNotEmpty()) AppCache.last = apps
+                if (!isDestroyed && !sameApps(apps, allApps)) {
                     allApps = apps
                     render()
                 }
@@ -800,10 +923,67 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    private fun sameApps(a: List<App>, b: List<App>): Boolean {
+        if (a.size != b.size) return false
+        for (i in a.indices) {
+            if (a[i].pkg != b[i].pkg || a[i].label != b[i].label) return false
+        }
+        return true
+    }
+
+    // ---------- Caché de banners y colores (memoria + disco) ----------
+
+    /** Cambia cuando se actualiza la app, así que invalida solo lo necesario. */
+    private fun cacheKey(pkg: String, tv: Boolean): String {
+        val t = try { packageManager.getPackageInfo(pkg, 0).lastUpdateTime } catch (e: Exception) { 0L }
+        return "v1|" + pkg + "|" + t + "|" + (if (tv) "t" else "n")
+    }
+
+    private fun bannerFile(key: String): File {
+        val dir = File(cacheDir, "banners")
+        dir.mkdirs()
+        return File(dir, key.replace(Regex("[^A-Za-z0-9._-]"), "_") + ".png")
+    }
+
+    private fun toBitmap(d: Drawable): Bitmap {
+        if (d is android.graphics.drawable.BitmapDrawable && d.bitmap != null) {
+            val b = d.bitmap
+            if (b.width <= 384) return b
+            return Bitmap.createScaledBitmap(b, 384, maxOf(1, b.height * 384 / b.width), true)
+        }
+        val iw = if (d.intrinsicWidth > 0) d.intrinsicWidth else 320
+        val ih = if (d.intrinsicHeight > 0) d.intrinsicHeight else 180
+        val k = minOf(1f, 384f / iw)
+        val w = maxOf(1, (iw * k).toInt())
+        val h = maxOf(1, (ih * k).toInt())
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        d.setBounds(0, 0, w, h)
+        d.draw(Canvas(bmp))
+        return bmp
+    }
+
+    /** Guarda primero la imagen y después el color: si existe el color, la entrada está completa. */
+    private fun saveCache(ap: android.content.SharedPreferences, key: String, banner: Drawable?, color: Int) {
+        try {
+            if (banner != null) {
+                val f = bannerFile(key)
+                val out = java.io.FileOutputStream(f)
+                try {
+                    toBitmap(banner).compress(Bitmap.CompressFormat.PNG, 100, out)
+                } finally {
+                    out.close()
+                }
+            }
+            ap.edit().putInt(key, color).apply()
+        } catch (e: Exception) { }
+    }
+
     private fun loadApps(): List<App> {
         val pm = packageManager
         val seen = HashSet<String>()
         val seenLabels = HashSet<String>() // evita apps repetidas con el mismo nombre
+        val keys = HashSet<String>()
+        val ap = getSharedPreferences("appcache", MODE_PRIVATE)
         val out = ArrayList<App>()
         for (cat in listOf(Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER)) {
             val tv = cat == Intent.CATEGORY_LEANBACK_LAUNCHER
@@ -821,8 +1001,18 @@ class MainActivity : Activity() {
                 if (!tv && system) continue
                 if (ai.icon == 0 && ai.applicationInfo.icon == 0) continue
 
-                val label = ri.loadLabel(pm).toString().trim()
                 if (ai.packageName in ALWAYS_HIDE_PKGS) continue
+
+                // 1) Caché en memoria: la app ya está lista, sin tocar banners ni iconos.
+                val key = cacheKey(ai.packageName, tv)
+                keys.add(key)
+                val hit = AppCache.map[key]
+                if (hit != null) {
+                    if (seenLabels.add(hit.label.lowercase(es))) out.add(hit)
+                    continue
+                }
+
+                val label = ri.loadLabel(pm).toString().trim()
                 val low = label.lowercase(es)
                 if (ALWAYS_HIDE_LABELS.any { low == it || (it.length > 8 && low.contains(it)) }) continue
                 if (!seenLabels.add(low)) continue
@@ -830,10 +1020,44 @@ class MainActivity : Activity() {
                 val launch = Intent(Intent.ACTION_MAIN).addCategory(cat)
                     .setClassName(ai.packageName, ai.name)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
-                val banner = if (tv) trimmed(ai.loadBanner(pm) ?: ai.applicationInfo.loadBanner(pm)) else null
-                val icon = ri.loadIcon(pm)
-                out.add(App(label, ai.packageName, launch, banner, icon, tv, dominant(banner ?: icon)))
+
+                // 2) Caché en disco: banner ya recortado y color ya calculado.
+                var banner: Drawable? = null
+                var color = 0
+                var fromDisk = false
+                if (ap.contains(key)) {
+                    color = ap.getInt(key, 0)
+                    fromDisk = true
+                    if (tv) {
+                        val f = bannerFile(key)
+                        if (f.exists()) {
+                            val bm = BitmapFactory.decodeFile(f.path)
+                            if (bm != null) banner = android.graphics.drawable.BitmapDrawable(resources, bm)
+                            else fromDisk = false
+                        }
+                    }
+                }
+                // 3) Primera vez (o app actualizada): se procesa y se guarda.
+                if (!fromDisk) {
+                    banner = if (tv) trimmed(ai.loadBanner(pm) ?: ai.applicationInfo.loadBanner(pm)) else null
+                }
+                val icon: Drawable = banner ?: ri.loadIcon(pm)
+                if (!fromDisk) {
+                    color = dominant(banner ?: icon)
+                    saveCache(ap, key, banner, color)
+                }
+                val app = App(label, ai.packageName, launch, banner, icon, tv, color)
+                AppCache.map[key] = app
+                out.add(app)
             }
+        }
+        // Limpia lo que ya no existe (apps desinstaladas o versiones antiguas).
+        AppCache.map.keys.retainAll(keys)
+        val stale = ap.all.keys.filter { it !in keys }
+        if (stale.isNotEmpty()) {
+            val e = ap.edit()
+            for (k in stale) { e.remove(k); bannerFile(k).delete() }
+            e.apply()
         }
         out.add(googleApp())
         if ("soundcloud" !in seenLabels) out.add(soundcloudApp()) // solo si no está la app de verdad
@@ -1133,4 +1357,36 @@ class MainActivity : Activity() {
         if (ring) g.setStroke(dp(3), Color.WHITE)
         return g
     }
+}
+
+/** Dibuja un código QR (módulos negros sobre fondo blanco con margen). */
+class QrView(context: Context, private val m: Array<BooleanArray>) : View(context) {
+    private val dark = Paint().apply { color = Color.BLACK }
+    private val light = Paint().apply { color = Color.WHITE }
+
+    override fun onDraw(canvas: Canvas) {
+        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), light)
+        val n = m.size
+        val quiet = 4
+        val total = n + 2 * quiet
+        val cell = minOf(width, height) / total
+        if (cell <= 0) return
+        val ox = (width - cell * total) / 2 + quiet * cell
+        val oy = (height - cell * total) / 2 + quiet * cell
+        for (y in 0 until n) {
+            for (x in 0 until n) {
+                if (m[y][x]) {
+                    val l = (ox + x * cell).toFloat()
+                    val t = (oy + y * cell).toFloat()
+                    canvas.drawRect(l, t, l + cell, t + cell, dark)
+                }
+            }
+        }
+    }
+}
+
+/** Caché a nivel de proceso: sobrevive aunque se destruya la pantalla. */
+object AppCache {
+    val map = HashMap<String, App>()
+    @Volatile var last: List<App>? = null
 }
