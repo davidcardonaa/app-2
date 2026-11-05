@@ -307,22 +307,60 @@ class MainActivity : Activity() {
         homePill.visibility = if (homeActive()) View.GONE else View.VISIBLE
     }
 
+    private var activating = false
+    private var homeFails = 0
+
+    private fun adbEnabled(): Boolean = try {
+        Settings.Global.getInt(contentResolver, Settings.Global.ADB_ENABLED, 0) == 1
+    } catch (e: Exception) { true } // si no se puede leer, se intenta igualmente
+
     private fun activateHome() {
+        if (activating) return
+
+        // Comprobación previa: sin Depuración ADB no tiene sentido esperar.
+        if (!adbEnabled()) {
+            Toast.makeText(
+                this,
+                "Primero activa la Depuración ADB:\nAjustes > Mi Fire TV > Opciones para desarrolladores.\n" +
+                    "(Si no sale ese menú: Acerca de > pulsa 7 veces sobre el nombre de la tele)",
+                Toast.LENGTH_LONG
+            ).show()
+            openSettings(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS,
+                "com.amazon.tv.settings.v2.tv.device.DeviceActivity")
+            return
+        }
+
+        activating = true
+        homePill.text = "Activando…"
         Toast.makeText(
             this,
-            "Activando… si la tele pide permiso de depuración, marca «Permitir siempre» y acepta",
+            "Si la tele pide permiso de depuración, marca «Permitir siempre» y acepta",
             Toast.LENGTH_LONG
         ).show()
-        HomeActivator.activate(this) { r ->
+        HomeActivator.activate(this, onProgress = { homePill.text = "Esperando permiso…" }) { r ->
+            activating = false
+            homePill.text = "Activar Home"
             when (r) {
-                is HomeActivator.Result.Ok ->
+                is HomeActivator.Result.Ok -> {
+                    homeFails = 0
                     Toast.makeText(this, "Listo: ahora Home abre Barrix", Toast.LENGTH_LONG).show()
-                is HomeActivator.Result.Error ->
-                    Toast.makeText(
-                        this,
-                        "No se pudo activar: " + r.message + "\n¿Está activada la Depuración ADB?",
-                        Toast.LENGTH_LONG
-                    ).show()
+                }
+                is HomeActivator.Result.Error -> {
+                    homeFails++
+                    Toast.makeText(this, "No se pudo activar.\n" + r.message, Toast.LENGTH_LONG).show()
+                    // Plan B tras dos fallos: activarlo a mano en Accesibilidad.
+                    if (homeFails >= 2) {
+                        Toast.makeText(
+                            this,
+                            "Plan B: en Accesibilidad busca «Barrix» y actívalo",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        try {
+                            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        } catch (e: Exception) { }
+                    }
+                }
             }
             refreshHomePill()
         }
