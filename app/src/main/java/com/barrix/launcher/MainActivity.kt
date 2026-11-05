@@ -84,6 +84,7 @@ class MainActivity : Activity() {
     private lateinit var photo: ImageView
     private lateinit var scrim: View
     private lateinit var aspectPill: TextView
+    private lateinit var homePill: TextView // NUEVO
     private lateinit var greet: TextView
     private lateinit var clock: TextView
     private lateinit var date: TextView
@@ -204,6 +205,10 @@ class MainActivity : Activity() {
         }
         (setBtn.layoutParams as LinearLayout.LayoutParams).leftMargin = dp(10)
         right.addView(setBtn)
+        // NUEVO: botón para activar el Home de Barrix (se oculta cuando ya está activo)
+        homePill = pill("Activar Home") { activateHome() }
+        (homePill.layoutParams as LinearLayout.LayoutParams).leftMargin = dp(10)
+        right.addView(homePill)
         header.addView(right, FrameLayout.LayoutParams(WC, WC, Gravity.END or Gravity.TOP))
 
         // Nombre de la app enfocada.
@@ -246,6 +251,7 @@ class MainActivity : Activity() {
         registerReceiver(ticker, IntentFilter(Intent.ACTION_TIME_TICK))
         tick()
         applyPhoto() // por si se ha subido una foto nueva desde Barrix
+        refreshHomePill() // NUEVO
         web?.onResume()
     }
 
@@ -287,6 +293,39 @@ class MainActivity : Activity() {
         }
         clock.text = SimpleDateFormat("H:mm", es).format(now)
         date.text = SimpleDateFormat("EEEE d 'de' MMMM", es).format(now).uppercase(es)
+    }
+
+    // ---------- Activar Home (servicio de accesibilidad) ---------- NUEVO
+
+    private fun homeActive(): Boolean {
+        val v = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+            ?: return false
+        return v.contains("com.barrix.launcher/com.barrix.launcher.HomeService")
+    }
+
+    private fun refreshHomePill() {
+        homePill.visibility = if (homeActive()) View.GONE else View.VISIBLE
+    }
+
+    private fun activateHome() {
+        Toast.makeText(
+            this,
+            "Activando… si la tele pide permiso de depuración, marca «Permitir siempre» y acepta",
+            Toast.LENGTH_LONG
+        ).show()
+        HomeActivator.activate(this) { r ->
+            when (r) {
+                is HomeActivator.Result.Ok ->
+                    Toast.makeText(this, "Listo: ahora Home abre Barrix", Toast.LENGTH_LONG).show()
+                is HomeActivator.Result.Error ->
+                    Toast.makeText(
+                        this,
+                        "No se pudo activar: " + r.message + "\n¿Está activada la Depuración ADB?",
+                        Toast.LENGTH_LONG
+                    ).show()
+            }
+            refreshHomePill()
+        }
     }
 
     // ---------- Colores y fondo ----------
